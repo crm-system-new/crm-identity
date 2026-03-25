@@ -1,14 +1,13 @@
 package handler
 
 import (
-	"net/http"
-
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/crm-system-new/crm-shared/pkg/auth"
+	"github.com/crm-system-new/crm-shared/pkg/health"
 )
 
-func NewRouter(authHandler *AuthHandler, userHandler *UserHandler, jwtManager *auth.JWTManager) *chi.Mux {
+func NewRouter(authHandler *AuthHandler, userHandler *UserHandler, jwtManager *auth.JWTManager, checker *health.Checker) *chi.Mux {
 	r := chi.NewRouter()
 
 	r.Use(middleware.Logger)
@@ -39,11 +38,9 @@ func NewRouter(authHandler *AuthHandler, userHandler *UserHandler, jwtManager *a
 		})
 	})
 
-	// Health check
-	r.Get("/health", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
-	})
+	// Health checks
+	r.Get("/health/live", checker.LiveHandler())
+	r.Get("/health/ready", checker.ReadyHandler())
 
 	return r
 }

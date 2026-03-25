@@ -14,9 +14,12 @@ import (
 	inframsg "github.com/crm-system-new/crm-identity/internal/infrastructure/messaging"
 	"github.com/crm-system-new/crm-identity/internal/infrastructure/postgres"
 	"github.com/crm-system-new/crm-identity/internal/service"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
 	"github.com/crm-system-new/crm-shared/pkg/auth"
 	"github.com/crm-system-new/crm-shared/pkg/config"
+	"github.com/crm-system-new/crm-shared/pkg/health"
 	sharedotel "github.com/crm-system-new/crm-shared/pkg/otel"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 	sharedpg "github.com/crm-system-new/crm-shared/pkg/postgres"
 )
 
@@ -61,14 +64,26 @@ func main() {
 	// Initialize JWT manager
 	jwtManager := auth.NewJWTManager(cfg.JWTSecret, 15*time.Minute, 7*24*time.Hour)
 
+	// Initialize outbox store and relay
+	outboxStore := outbox.NewPgStore(pool)
+	relay := outbox.NewRelay(outboxStore, publisher, 500*time.Millisecond, 100)
+	relay.Start()
+	defer relay.Stop()
+
+	// Initialize audit logger
+	auditLogger := audit.NewLogger(pool)
+
+	// Initialize health checker
+	checker := health.NewChecker(pool, cfg.NatsURL)
+
 	// Wire dependencies
 	userRepo := postgres.NewUserRepository(pool)
-	authService := service.NewAuthService(userRepo, publisher, jwtManager)
+	authService := service.NewAuthService(userRepo, pool, outboxStore, auditLogger, jwtManager)
 	userService := service.NewUserService(userRepo)
 	authHandler := handler.NewAuthHandler(authService)
 	userHandler := handler.NewUserHandler(userService)
 
-	router := handler.NewRouter(authHandler, userHandler, jwtManager)
+	router := handler.NewRouter(authHandler, userHandler, jwtManager, checker)
 
 	// Start HTTP server
 	addr := fmt.Sprintf(":%d", cfg.ServicePort)

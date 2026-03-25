@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/crm-system-new/crm-identity/internal/domain"
+	"github.com/crm-system-new/crm-shared/pkg/audit"
 	"github.com/crm-system-new/crm-shared/pkg/auth"
-	"github.com/crm-system-new/crm-shared/pkg/messaging"
+	"github.com/crm-system-new/crm-shared/pkg/outbox"
 )
 
 type RegisterRequest struct {
@@ -29,16 +32,20 @@ type LoginRequest struct {
 }
 
 type AuthService struct {
-	repo       domain.UserRepository
-	publisher  messaging.EventPublisher
-	jwtManager *auth.JWTManager
+	repo         domain.UserRepository
+	pool         *pgxpool.Pool
+	outboxStore  outbox.Store
+	auditLogger  *audit.Logger
+	jwtManager   *auth.JWTManager
 }
 
-func NewAuthService(repo domain.UserRepository, publisher messaging.EventPublisher, jwtManager *auth.JWTManager) *AuthService {
+func NewAuthService(repo domain.UserRepository, pool *pgxpool.Pool, outboxStore outbox.Store, auditLogger *audit.Logger, jwtManager *auth.JWTManager) *AuthService {
 	return &AuthService{
-		repo:       repo,
-		publisher:  publisher,
-		jwtManager: jwtManager,
+		repo:        repo,
+		pool:        pool,
+		outboxStore: outboxStore,
+		auditLogger: auditLogger,
+		jwtManager:  jwtManager,
 	}
 }
 
@@ -58,14 +65,46 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*Regis
 		return nil, err
 	}
 
-	if err := s.repo.Save(ctx, user); err != nil {
+	// Start transaction for atomic save + outbox + audit
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := s.repo.SaveInTx(ctx, tx, user); err != nil {
 		return nil, fmt.Errorf("save user: %w", err)
 	}
 
-	// Publish domain events
-	for _, event := range user.PullEvents() {
-		data, _ := json.Marshal(event)
-		s.publisher.Publish(ctx, "crm."+event.EventType(), data)
+	// Convert domain events to outbox entries
+	events := user.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+		return nil, fmt.Errorf("insert outbox entries: %w", err)
+	}
+
+	// Audit log
+	changes, _ := json.Marshal(map[string]string{
+		"email":      req.Email,
+		"first_name": req.FirstName,
+		"last_name":  req.LastName,
+	})
+	if err := s.auditLogger.LogInTx(ctx, tx, audit.LogEntry{
+		Action:     "create",
+		EntityType: "user",
+		EntityID:   user.ID,
+		UserID:     user.ID,
+		Changes:    changes,
+	}); err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	return &RegisterResponse{
@@ -99,13 +138,29 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*auth.TokenP
 		return nil, fmt.Errorf("generate tokens: %w", err)
 	}
 
-	// Update last login
-	_ = s.repo.Update(ctx, user)
+	// Update last login + publish auth event via outbox in a transaction
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
 
-	// Publish events
-	for _, event := range user.PullEvents() {
-		data, _ := json.Marshal(event)
-		s.publisher.Publish(ctx, "crm."+event.EventType(), data)
+	if err := s.repo.UpdateInTx(ctx, tx, user); err != nil {
+		return nil, fmt.Errorf("update user: %w", err)
+	}
+
+	events := user.PullEvents()
+	entries, err := outbox.FromDomainEvents(events, "crm.")
+	if err != nil {
+		return nil, fmt.Errorf("convert events to outbox: %w", err)
+	}
+
+	if err := s.outboxStore.InsertInTx(ctx, tx, entries); err != nil {
+		return nil, fmt.Errorf("insert outbox entries: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 
 	return tokenPair, nil

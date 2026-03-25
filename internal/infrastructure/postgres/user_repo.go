@@ -86,6 +86,21 @@ func (r *UserRepository) Save(ctx context.Context, user *domain.User) error {
 	return nil
 }
 
+func (r *UserRepository) SaveInTx(ctx context.Context, tx pgx.Tx, user *domain.User) error {
+	query := `INSERT INTO users (id, email, password_hash, first_name, last_name, status, last_login_at, version, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`
+
+	_, err := tx.Exec(ctx, query,
+		user.ID, user.Email, user.PasswordHash,
+		user.FirstName, user.LastName, user.Status,
+		user.LastLoginAt, user.Version, user.CreatedAt, user.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert user in tx: %w", err)
+	}
+	return nil
+}
+
 func (r *UserRepository) Update(ctx context.Context, user *domain.User) error {
 	oldVersion := user.Version
 	user.IncrementVersion()
@@ -95,6 +110,21 @@ func (r *UserRepository) Update(ctx context.Context, user *domain.User) error {
 		WHERE id=$9 AND version=$10`
 
 	return sharedpg.ExecWithOptimisticLockPool(ctx, r.pool, query,
+		user.Email, user.PasswordHash, user.FirstName, user.LastName,
+		user.Status, user.LastLoginAt, user.UpdatedAt, user.Version,
+		user.ID, oldVersion,
+	)
+}
+
+func (r *UserRepository) UpdateInTx(ctx context.Context, tx pgx.Tx, user *domain.User) error {
+	oldVersion := user.Version
+	user.IncrementVersion()
+
+	query := `UPDATE users SET email=$1, password_hash=$2, first_name=$3, last_name=$4,
+		status=$5, last_login_at=$6, updated_at=$7, version=$8
+		WHERE id=$9 AND version=$10`
+
+	return sharedpg.ExecWithOptimisticLock(ctx, tx, query,
 		user.Email, user.PasswordHash, user.FirstName, user.LastName,
 		user.Status, user.LastLoginAt, user.UpdatedAt, user.Version,
 		user.ID, oldVersion,
